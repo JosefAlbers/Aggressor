@@ -4,16 +4,18 @@ A simplest possible implementation of [Autoregressive Image Generation without V
 
 ## Key Features
 
-- **Basic Architecture**: Single attention block for transformer and a tiny MLP for diffusion.
+- **Simple Architecture**: A tiny transformer for autoregression and an MLP for diffusion.
 - **Single-File Implementation**: Entire model in one Python file.
-- **Minimal Dependencies**: Core components built from scratch using basic MLX operations.
+- **Minimal Dependencies**: Built from scratch using only basic MLX operations.
 
 ## Components
 
 - `Aggressor`: Main model class combining transformer and diffusion.
-- `Attention`: Single block with basic Rotary Position Embedding (RoPE).
-- `Denoiser`: Small MLP-based diffusion process.
-- `Scheduler`: Handles sampling processes.
+- `Transformer`: Multi-layer transformer with attention and MLP blocks.
+- `Denoiser`: MLP-based diffusion process with time embedding.
+- `Scheduler`: Handles forward and backward processes for diffusion.
+- `Attention`: Multi-head attention mechanism.
+- `MLP`: Basic multi-layer perceptron with SiLU activation.
 
 ## Usage
 
@@ -21,9 +23,9 @@ A simplest possible implementation of [Autoregressive Image Generation without V
 python aggressor.py
 ```
 
-![Alt text](https://raw.githubusercontent.com/JosefAlbers/Aggressor/main/assets/aggressor.png)
+![Alt text](https://raw.githubusercontent.com/JosefAlbers/Aggressor/main/assets/aggressor_mnist.png)
 
-*(Training on 60000 images x 50 epochs takes approximately 15~16 minutes on 8GB M1 MacBook.)*
+*(Training on 60000 images x 30 epochs takes approximately 7~8 minutes on 8GB M2 MacBook.)*
 
 ## Acknowledgements
 
