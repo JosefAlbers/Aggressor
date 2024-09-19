@@ -23,9 +23,11 @@ A simplest possible implementation of [Autoregressive Image Generation without V
 python aggressor.py
 ```
 
+![Alt text](https://raw.githubusercontent.com/JosefAlbers/Aggressor/main/assets/aggressor_cifar.png)
+
 ![Alt text](https://raw.githubusercontent.com/JosefAlbers/Aggressor/main/assets/aggressor_mnist.png)
 
-*(Training on 60000 images x 30 epochs takes approximately 7~8 minutes on 8GB M2 MacBook.)*
+*(Training on 60000 images x 20 epochs takes approximately 7~8 minutes on 8GB M2 MacBook.)*
 
 ## Acknowledgements
 
