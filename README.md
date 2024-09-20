@@ -14,8 +14,6 @@ A simplest possible implementation of [Autoregressive Image Generation without V
 - `Transformer`: Multi-layer transformer with attention and MLP blocks.
 - `Denoiser`: MLP-based diffusion process with time embedding.
 - `Scheduler`: Handles forward and backward processes for diffusion.
-- `Attention`: Multi-head attention mechanism.
-- `MLP`: Basic multi-layer perceptron with SiLU activation.
 
 ## Usage
 
