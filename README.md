@@ -1,4 +1,4 @@
-# Aggressor: Ultra-minimal autoregressive diffusion model for image generation
+# Aggressor: Ultra-minimal autoregressive diffusion model for image and speech generation
 
 <table>
 <tr>
@@ -42,9 +42,8 @@ A simplest possible implementation of [Autoregressive Image Generation without V
 ## Key Features
 
 - **Simple Architecture**: A tiny transformer for autoregression and an MLP for diffusion.
-- **Single-File Implementation**: Entire model in one Python file.
 - **Minimal Dependencies**: Built from scratch using only basic MLX operations.
-- **Audio Generation**: Includes `wav_aggressor.py` for audio generation.
+- **Single-File Implementation**: Entire model in one Python file `aggressor.py`.
 
 ## Components
 
