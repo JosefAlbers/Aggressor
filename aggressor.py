@@ -12,7 +12,6 @@ from datasets import load_dataset
 from einops.array_api import rearrange
 from mlx.utils import tree_flatten
 from PIL import Image
-from scipy.fftpack import dctn, idctn
 
 EPS = 1e-5
 
@@ -136,14 +135,8 @@ class Scheduler(nn.Module):
         noise_t = mx.sqrt(beta_t) * mx.random.normal(x_t.shape)
         return mu_t + noise_t
 
-def get_decay(image_shape, gamma=0.999):
-    i, j = np.ogrid[:image_shape[0], :image_shape[1]]
-    gamma = gamma**(i + j)
-    gamma = np.repeat(gamma[...,None], image_shape[-1], -1)
-    return mx.array(gamma, dtype=mx.float32)
-
 class Aggressor(nn.Module):
-    def __init__(self, image_shape, n_chop, n_head, n_diff, n_loop, n_layer, use_dct):
+    def __init__(self, image_shape, n_chop, n_head, n_diff, n_loop, n_layer):
         super().__init__()
         self.image_shape = image_shape
         self.n_chop = n_chop
@@ -156,12 +149,6 @@ class Aggressor(nn.Module):
         self.start_token = mx.zeros(dim)[None, None]
         self.n_loop = n_loop
         self._pe = mx.array(np.indices((n_chop, n_chop))).reshape(2, -1).T
-        self.use_dct = use_dct
-        if use_dct:
-            _decay = get_decay(image_shape)
-        else:
-            _decay = mx.ones(image_shape, dtype=mx.float32)
-        self._decay = rearrange(_decay, f'(h ph) (w pw) c -> (h w) (ph pw c)', ph=self.patch_size[0], pw=self.patch_size[1])
     def __call__(self, seq):
         seq = rearrange(seq, f'b (h ph) (w pw) c -> b (h w) (ph pw c)', ph=self.patch_size[0], pw=self.patch_size[1])
         B, S, _ = seq.shape
@@ -176,7 +163,7 @@ class Aggressor(nn.Module):
             eps = mx.random.normal(seq.shape)
             x_t = self.scheduler.forward(seq, t, eps)
             eps_theta = self.diffusion(x_t, t, cond)
-            loss = mx.sum(((eps - eps_theta) ** 2) * self._decay)
+            loss = mx.sum((eps - eps_theta) ** 2)
             if mx.isnan(loss):
                 print(loss.item())
                 continue
@@ -197,6 +184,7 @@ class Aggressor(nn.Module):
                 t_batch = mx.array([t] * batch_size)
                 eps_theta = self.diffusion(x, t_batch, cond[:, -1:])
                 x = self.scheduler.backward(lambda x, t: self.diffusion(x, t, cond[:, -1:]), x, t)
+                mx.eval(x)
             generated = mx.concatenate([generated, x], axis=1)
             cond_seq = x
             mx.eval(cond_seq, generated)
@@ -204,11 +192,7 @@ class Aggressor(nn.Module):
                                 h=self.n_chop, w=self.n_chop,
                                 ph=self.patch_size[0], pw=self.patch_size[1], c=self.image_shape[-1])
         generated = np.array(generated)
-        if self.use_dct:
-            generated = idctn(generated, axes=(1, 2), norm='ortho')
-            generated = np.clip(generated, 0, 1) * 255
-        else:
-            generated = (np.clip(generated, -1, 1) + 1) / 2 * 255
+        generated = (np.clip(generated, -1, 1) + 1) / 2 * 255
         return generated.astype(np.uint8)
 
 def sample(model, f_name='aggressor', n_sample_per_side=4):
@@ -230,11 +214,7 @@ def train(model, dataset, n_epoch, batch_size, lr, postfix):
             batch_img = np.array(batch['image' if 'image' in batch else 'img'], dtype=np.float32)
             if batch_img.ndim < 4:
                 batch_img = batch_img[:, :, :, None]
-            if model.use_dct:
-                batch_img = batch_img / 255.0
-                batch_img = dctn(batch_img, axes=(1, 2), norm='ortho')
-            else:
-                batch_img = (((batch_img / 255.0) - 0.5) * 2.0)
+            batch_img = (((batch_img / 255.0) - 0.5) * 2.0)
             yield mx.array(batch_img, dtype=mx.float32)
     def evaluate(model, dataset):
         model.eval()
@@ -246,7 +226,7 @@ def train(model, dataset, n_epoch, batch_size, lr, postfix):
         return loss / step
     def loss_fn(model, x):
         return model(x)
-    f_name = f'{dataset.info.dataset_name}_{datetime.now().strftime("%Y%m%d_%H%M%S")}_{n_epoch}{postfix}'
+    f_name = f'{dataset.info.dataset_name}_{datetime.now().strftime("%Y%m%d_%H%M%S")}{postfix}'
     print(f'{f_name} {model.image_shape} {model.n_chop} {model.patch_size} {model.dim}')
     loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
     _n_steps = math.ceil(n_epoch * len(dataset) / batch_size)
@@ -286,9 +266,9 @@ def train(model, dataset, n_epoch, batch_size, lr, postfix):
     model.load_weights(f'{f_name}.safetensors')
     sample(model=model, f_name=f_name, n_sample_per_side=10)
 
-def main(dataset_name='mnist', label=None, n_chop=2, n_head=1, n_diff=1000, n_epoch=20, batch_size=32, lr=3e-4, n_loop=4, n_layer=4, use_dct=False, postfix=''):
+def main(dataset_name='mnist', label=None, n_chop=2, n_head=1, n_diff=1000, n_epoch=20, batch_size=32, lr=3e-4, n_loop=4, n_layer=4, postfix=''):
     dataset, image_shape = get_dataset_info(dataset_name=dataset_name, batch_size=batch_size, label=label)
-    model = Aggressor(image_shape=image_shape, n_chop=n_chop, n_head=n_head, n_diff=n_diff, n_loop=n_loop, n_layer=n_layer, use_dct=use_dct)
+    model = Aggressor(image_shape=image_shape, n_chop=n_chop, n_head=n_head, n_diff=n_diff, n_loop=n_loop, n_layer=n_layer)
     train(model=model, dataset=dataset, n_epoch=n_epoch, batch_size=batch_size, lr=lr, postfix=postfix)
     # model.load_weights('cifar.safetensors')
     # sample(model=model, f_name='aggressor_cifar', n_sample_per_side=10)

@@ -8,15 +8,24 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
-from datasets import load_dataset, load_from_disk
+from datasets import load_dataset
 from einops.array_api import rearrange
 from mlx.utils import tree_flatten
 from PIL import Image
-from scipy.fftpack import idct
-from scipy.io import wavfile
-import soundfile as sf
+from scipy.fftpack import dctn, idctn
 
 EPS = 1e-5
+
+def get_dataset_info(dataset_name, batch_size, label=5):
+    dataset = load_dataset(dataset_name, split='train')
+    if label is not None and label in dataset['label']:
+        dataset = dataset.filter(lambda x: x['label'] == label)
+    _take = (len(dataset) // batch_size) * batch_size
+    dataset = dataset.take(_take)
+    sample = np.array(dataset[0]['image'] if 'image' in dataset[0] else dataset[0]['img'])
+    if sample.ndim < 3:
+        sample = sample[:, :, None]
+    return dataset, sample.shape
 
 class MLP(nn.Module):
     def __init__(self, dim, out_dim=None):
@@ -127,42 +136,54 @@ class Scheduler(nn.Module):
         noise_t = mx.sqrt(beta_t) * mx.random.normal(x_t.shape)
         return mu_t + noise_t
 
-def decompress_audio(sample, f_name):
-    compressed, segment_size, sample_rate = sample['compressed_audio'], sample['segment_size'], sample['sample_rate']
-    decompressed_segments = []
-    for segment in compressed:
-        full_segment = np.zeros(segment_size)
-        full_segment[:len(segment)] = segment
-        decompressed_segments.append(idct(full_segment, norm='ortho'))
-    decompressed_audio = np.concatenate(decompressed_segments)
-    if np.max(np.abs(decompressed_audio)) > 0:
-        decompressed_audio = decompressed_audio / np.max(np.abs(decompressed_audio)) * 32767
-    decompressed_audio = np.int16(decompressed_audio)
-    # wavfile.write(f'{f_name}.wav', sample['sample_rate'], decompressed_audio)
-    sf.write(f'{f_name}.mp3', decompressed_audio, sample['sample_rate'], format='mp3')
+def get_zigzag_indices(N):
+    indices = np.zeros(N * N, dtype=int)
+    index = 0
+    for diagonal in range(N):
+        for i in range(diagonal + 1):
+            indices[index] = i * N + diagonal
+            index += 1
+        for j in range(diagonal - 1, -1, -1):
+            indices[index] = diagonal * N + j
+            index += 1
+    return indices
+
+def zigzag_scan_batch(arr, zigzag_indices):
+    B, H, _, C = arr.shape
+    return arr.reshape(B, H*H, C)[:, zigzag_indices, :]
+
+def inverse_zigzag_scan_batch(zigzagged_arr, zigzag_indices, H):
+    B, _, C = zigzagged_arr.shape
+    inverse_indices = np.argsort(zigzag_indices)
+    return zigzagged_arr[:, inverse_indices, :].reshape(B, H, H, C)
+
+def get_decay(image_shape, gamma=0.999):
+    i, j = np.ogrid[:image_shape[0], :image_shape[1]]
+    # gamma = gamma ** np.maximum(i, j)
+    gamma = gamma**(i + j)
+    gamma = np.repeat(gamma[...,None], image_shape[-1], -1)
+    return gamma
 
 class Aggressor(nn.Module):
-    def __init__(self, image_shape, n_head, n_diff, n_loop, n_layer, segment_size, sample_rate):
+    def __init__(self, image_shape, n_chop, n_head, n_diff, n_loop, n_layer):
         super().__init__()
         self.image_shape = image_shape
-        self.segment_size = segment_size
-        self.sample_rate = sample_rate
-        self.dim = dim = image_shape[-1]
+        self.n_chop = n_chop
+        self.dim = dim = image_shape[0] * image_shape[1] * image_shape[2] // n_chop
         self.n_diff = n_diff
         self.transformer = Transformer(dim=dim+2, n_head=n_head, n_layer=n_layer)
         self.diffusion = Denoiser(dim=dim, n_layer=n_layer)
         self.scheduler = Scheduler(n_diff=n_diff)
         self.start_token = mx.zeros(dim)[None, None]
         self.n_loop = n_loop
-        self._pe = mx.array(np.indices((1, image_shape[0]))).reshape(2, -1).T
-        self._scale_factors = self.create_scale_factors(dim)
-    def create_scale_factors(self, num_coeffs, min_scale=1e4, max_scale=1e6):
-        x = np.linspace(0, 1, num_coeffs)
-        factors = 1 / (1 + np.exp((x - 0.5) * 10))
-        factors = min_scale + (max_scale - min_scale) * factors
-        return mx.array(factors)
+        self._pe = mx.array(np.indices((1, n_chop))).reshape(2, -1).T
+        self._zigzag = _zigzag = get_zigzag_indices(image_shape[0])
+        _decay = get_decay(image_shape)
+        _decay = zigzag_scan_batch(_decay[None], _zigzag)
+        _decay = rearrange(_decay, 'b (n l) c -> b n (l c)', n=n_chop)
+        self._decay = mx.array(_decay, dtype=mx.float32)
     def __call__(self, seq):
-        seq = mx.arcsinh(seq * self._scale_factors[None, None, :])
+        seq = rearrange(seq, 'b (n l) c -> b n (l c)', n=self.n_chop)
         B, S, _ = seq.shape
         cond_seq = seq[:, :-1]
         cond_seq = mx.concatenate([mx.repeat(self.start_token, B, 0), cond_seq], axis=1)
@@ -175,7 +196,7 @@ class Aggressor(nn.Module):
             eps = mx.random.normal(seq.shape)
             x_t = self.scheduler.forward(seq, t, eps)
             eps_theta = self.diffusion(x_t, t, cond)
-            loss = mx.sum((eps - eps_theta) ** 2)
+            loss = mx.sum(((eps - eps_theta) ** 2) * self._decay)
             if mx.isnan(loss):
                 print(loss.item())
                 continue
@@ -187,7 +208,7 @@ class Aggressor(nn.Module):
         generated = mx.zeros((batch_size, 0, self.dim))
         cond_seq = mx.repeat(self.start_token, batch_size, 0)
         cache = None
-        for p in range(self.image_shape[0]):
+        for p in range(self.n_chop):
             cond_seq = mx.concatenate([cond_seq, mx.repeat(self._pe[p][None,None,:], batch_size, 0)], axis = -1)
             cond, cache = self.transformer(cond_seq, cache=cache)
             x = mx.random.normal((batch_size, 1, self.dim))
@@ -195,27 +216,39 @@ class Aggressor(nn.Module):
                 t_batch = mx.array([t] * batch_size)
                 eps_theta = self.diffusion(x, t_batch, cond[:, -1:])
                 x = self.scheduler.backward(lambda x, t: self.diffusion(x, t, cond[:, -1:]), x, t)
+                mx.eval(x)
             generated = mx.concatenate([generated, x], axis=1)
             cond_seq = x
-            mx.eval(cache, cond_seq, generated)
-        generated = mx.sinh(generated) / self._scale_factors[None, None, :]
-        return np.array(generated)
+            mx.eval(cond_seq, generated)
+        generated = np.array(generated)
+        generated = rearrange(generated, 'b n (l c) -> b (n l) c', c=self.image_shape[-1])
+        generated = inverse_zigzag_scan_batch(generated, self._zigzag, self.image_shape[0])
+        generated = idctn(generated, axes=(1, 2), norm='ortho')
+        generated = np.clip(generated, 0, 1) * 255
+        return generated.astype(np.uint8)
 
-def sample(model, f_name='aggressor', n_samples=1):
+def sample(model, f_name='aggressor', n_sample_per_side=4):
     model.eval()
     mx.eval(model)
     tic = time.perf_counter()
-    X = model.sample(batch_size=n_samples)
-    for i, x in enumerate(X):
-        sample = dict(compressed_audio=x, segment_size=model.segment_size, sample_rate=model.sample_rate)
-        decompress_audio(sample, f'{f_name}_{i}')
-    print(f'Saved {n_samples} samples to {f_name} ({time.perf_counter() - tic:.2f} sec)')
+    x = model.sample(batch_size=n_sample_per_side**2)
+    x = x.reshape(n_sample_per_side, n_sample_per_side, *model.image_shape)
+    x = rearrange(x, 'bh bw h w c -> (bh h) (bw w) c')
+    if x.shape[-1] == 1:
+        x = x.squeeze(-1)
+    Image.fromarray(np.array(x)).save(f'{f_name}.png')
+    print(f'Saved {n_sample_per_side**2} images to {f_name}.png ({time.perf_counter() - tic:.2f} sec)')
 
 def train(model, dataset, n_epoch, batch_size, lr, postfix):
     def get_batch(dataset):
         for i in range(0, len(dataset), batch_size):
             batch = dataset[i:i+batch_size]
-            batch_img = np.array(batch['compressed_audio'], dtype=np.float32)
+            batch_img = np.array(batch['image' if 'image' in batch else 'img'], dtype=np.float32)
+            if batch_img.ndim < 4:
+                batch_img = batch_img[:, :, :, None]
+            batch_img = batch_img / 255.0
+            batch_img = dctn(batch_img, axes=(1, 2), norm='ortho')
+            batch_img = zigzag_scan_batch(batch_img, model._zigzag)
             yield mx.array(batch_img, dtype=mx.float32)
     def evaluate(model, dataset):
         model.eval()
@@ -227,8 +260,8 @@ def train(model, dataset, n_epoch, batch_size, lr, postfix):
         return loss / step
     def loss_fn(model, x):
         return model(x)
-    f_name = f'{dataset.info.dataset_name}_wav_{datetime.now().strftime("%Y%m%d_%H%M%S")}{postfix}'
-    print(f'{f_name} {model.image_shape} {model.dim}')
+    f_name = f'{dataset.info.dataset_name}_dct_{datetime.now().strftime("%Y%m%d_%H%M%S")}{postfix}'
+    print(f'{f_name} {model.image_shape} {model.n_chop} {model.dim}')
     loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
     _n_steps = math.ceil(n_epoch * len(dataset) / batch_size)
     _n_warmup = _n_steps//5
@@ -248,6 +281,7 @@ def train(model, dataset, n_epoch, batch_size, lr, postfix):
             model.train()
             loss, grads = loss_and_grad_fn(model, x)
             optimizer.update(model, grads)
+            # grads, _ = optim.clip_grad_norm(grads, max_norm=0.1)
             mx.eval(loss, model, optimizer)
             total_loss += loss.item() * x.shape[0]
             total_step += x.shape[0]
@@ -264,19 +298,15 @@ def train(model, dataset, n_epoch, batch_size, lr, postfix):
         if (e+1) % (n_epoch//5) == 0:
             sample(model=model, f_name=f_name)
     model.load_weights(f'{f_name}.safetensors')
-    sample(model=model, f_name=f_name, n_samples=4)
+    sample(model=model, f_name=f_name, n_sample_per_side=10)
 
-def get_audio_dataset(path_ds, batch_size):
-    dataset = load_dataset(path_ds, split='train')
-    _take = (len(dataset) // batch_size) * batch_size
-    dataset = dataset.take(_take)
-    print(f'{len(dataset)=}')
-    return dataset, np.array(dataset[0]['compressed_audio']).shape, dataset[0]['segment_size'], dataset[0]['sample_rate']
-
-def main(path_ds='JosefAlbers/fluent_speech_commands_female', n_head=1, n_diff=1000, n_epoch=200, batch_size=1, lr=3e-4, n_loop=4, n_layer=16, postfix=''):
-    dataset, image_shape, segment_size, sample_rate = get_audio_dataset(path_ds=path_ds, batch_size=batch_size)
-    model = Aggressor(image_shape=image_shape, n_head=n_head, n_diff=n_diff, n_loop=n_loop, n_layer=n_layer, segment_size=segment_size, sample_rate=sample_rate)
+def main(dataset_name='cifar10', label=5, n_chop=4, n_head=1, n_diff=1000, n_epoch=200, batch_size=128, lr=3e-4, n_loop=4, n_layer=16, postfix=''):
+    dataset, image_shape = get_dataset_info(dataset_name=dataset_name, batch_size=batch_size, label=label)
+    model = Aggressor(image_shape=image_shape, n_chop=n_chop, n_head=n_head, n_diff=n_diff, n_loop=n_loop, n_layer=n_layer)
     train(model=model, dataset=dataset, n_epoch=n_epoch, batch_size=batch_size, lr=lr, postfix=postfix)
+    # model.load_weights('cifar.safetensors')
+    # sample(model=model, f_name='aggressor_cifar', n_sample_per_side=10)
 
 if __name__ == '__main__':
+    # main('mnist', label=None, n_chop=2, n_epoch=20, batch_size=128, n_layer=4)
     fire.Fire(main)

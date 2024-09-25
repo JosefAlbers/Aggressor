@@ -299,7 +299,7 @@ def train(model, dataset, n_epoch, batch_size, lr, postfix):
         return loss / step
     def loss_fn(model, x):
         return model(x)
-    f_name = f'{dataset.info.dataset_name}_{datetime.now().strftime("%Y%m%d_%H%M%S")}_{n_epoch}{postfix}'
+    f_name = f'{dataset.info.dataset_name}_ret_{datetime.now().strftime("%Y%m%d_%H%M%S")}{postfix}'
     print(f'{f_name} {model.image_shape} {model.n_chop} {model.patch_size} {model.dim}')
     loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
     _n_steps = math.ceil(n_epoch * len(dataset) / batch_size)
