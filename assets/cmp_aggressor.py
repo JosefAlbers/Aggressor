@@ -23,9 +23,7 @@ def get_dataset_info(dataset_name, batch_size, label=5):
     _take = (len(dataset) // batch_size) * batch_size
     dataset = dataset.take(_take)
     sample = np.array(dataset[0]['image'] if 'image' in dataset[0] else dataset[0]['img'])
-    if sample.ndim < 3:
-        sample = sample[:, :, None]
-    return dataset, sample.shape
+    return dataset, (*sample.shape[:2], 3)
 
 class MLP(nn.Module):
     def __init__(self, dim, out_dim=None):
@@ -157,10 +155,11 @@ def inverse_zigzag_scan_batch(zigzagged_arr, zigzag_indices, H):
     return zigzagged_arr[:, inverse_indices, :].reshape(B, H, H, C)
 
 def get_decay(image_shape, gamma=0.999):
-    i, j = np.ogrid[:image_shape[0], :image_shape[1]]
+    H, W, C = image_shape
+    i, j = np.ogrid[:H, :W]
     # gamma = gamma ** np.maximum(i, j)
     gamma = gamma**(i + j)
-    gamma = np.repeat(gamma[...,None], image_shape[-1], -1)
+    gamma = np.repeat(gamma[..., None], C, axis=-1)
     return gamma
 
 class Aggressor(nn.Module):
@@ -168,21 +167,22 @@ class Aggressor(nn.Module):
         super().__init__()
         self.image_shape = image_shape
         self.n_chop = n_chop
-        self.dim = dim = image_shape[0] * image_shape[1] * image_shape[2] // n_chop
+        self.num_patches = num_patches = n_chop * image_shape[-1]
+        self.dim = dim = image_shape[0] * image_shape[1] // n_chop
         self.n_diff = n_diff
         self.transformer = Transformer(dim=dim+2, n_head=n_head, n_layer=n_layer)
         self.diffusion = Denoiser(dim=dim, n_layer=n_layer)
         self.scheduler = Scheduler(n_diff=n_diff)
         self.start_token = mx.zeros(dim)[None, None]
         self.n_loop = n_loop
-        self._pe = mx.array(np.indices((1, n_chop))).reshape(2, -1).T
+        self._pe = mx.array(np.indices((1, num_patches))).reshape(2, -1).T[:self.image_shape[-1],:]
         self._zigzag = _zigzag = get_zigzag_indices(image_shape[0])
         _decay = get_decay(image_shape)
         _decay = zigzag_scan_batch(_decay[None], _zigzag)
-        _decay = rearrange(_decay, 'b (n l) c -> b n (l c)', n=n_chop)
-        self._decay = mx.array(_decay, dtype=mx.float32)
+        _decay = rearrange(_decay, 'b (n l) c -> b (n c) l', n=n_chop)
+        self._decay = mx.array(_decay, dtype=mx.float32)[:,:self.image_shape[-1],:]
     def __call__(self, seq):
-        seq = rearrange(seq, 'b (n l) c -> b n (l c)', n=self.n_chop)
+        seq = rearrange(seq, 'b (n l) c -> b (n c) l', n=self.n_chop)[:,:self.image_shape[-1],:]
         B, S, _ = seq.shape
         cond_seq = seq[:, :-1]
         cond_seq = mx.concatenate([mx.repeat(self.start_token, B, 0), cond_seq], axis=1)
@@ -207,7 +207,7 @@ class Aggressor(nn.Module):
         generated = mx.zeros((batch_size, 0, self.dim))
         cond_seq = mx.repeat(self.start_token, batch_size, 0)
         cache = None
-        for p in range(self.n_chop):
+        for p in range(self.image_shape[-1]):
             cond_seq = mx.concatenate([cond_seq, mx.repeat(self._pe[p][None,None,:], batch_size, 0)], axis = -1)
             cond, cache = self.transformer(cond_seq, cache=cache)
             x = mx.random.normal((batch_size, 1, self.dim))
@@ -219,11 +219,13 @@ class Aggressor(nn.Module):
             cond_seq = x
             mx.eval(cond_seq, generated)
         generated = np.array(generated)
-        generated = rearrange(generated, 'b n (l c) -> b (n l) c', c=self.image_shape[-1])
+        _generated = np.zeros((batch_size, self.num_patches, self.dim))
+        _generated[:,:generated.shape[1],:] = generated
+        generated = _generated
+        generated = rearrange(generated, 'b (n c) l -> b (n l) c', n=self.n_chop)
         generated = inverse_zigzag_scan_batch(generated, self._zigzag, self.image_shape[0])
         generated = idctn(generated, axes=(1, 2), norm='ortho')
-        generated = np.clip(generated, 0, 1) * 255
-        return generated.astype(np.uint8)
+        return generated
 
 def sample(model, f_name='aggressor', n_sample_per_side=4):
     model.eval()
@@ -232,18 +234,24 @@ def sample(model, f_name='aggressor', n_sample_per_side=4):
     x = model.sample(batch_size=n_sample_per_side**2)
     x = x.reshape(n_sample_per_side, n_sample_per_side, *model.image_shape)
     x = rearrange(x, 'bh bw h w c -> (bh h) (bw w) c')
+    x = x * 255.0
     if x.shape[-1] == 1:
         x = x.squeeze(-1)
-    Image.fromarray(np.array(x)).save(f'{f_name}.png')
+        Image.fromarray(x).save(f'{f_name}.png')
+    else:
+        x = np.clip(x, 0, 255).astype('uint8')
+        Image.fromarray(x, mode='YCbCr').convert('RGB').save(f'{f_name}.png')
     print(f'Saved {n_sample_per_side**2} images to {f_name}.png ({time.perf_counter() - tic:.2f} sec)')
 
 def train(model, dataset, n_epoch, batch_size, lr, postfix):
     def get_batch(dataset):
         for i in range(0, len(dataset), batch_size):
             batch = dataset[i:i+batch_size]
-            batch_img = np.array(batch['image' if 'image' in batch else 'img'], dtype=np.float32)
+            batch_img = np.array(batch['image' if 'image' in batch else 'img'], dtype=np.uint8)
             if batch_img.ndim < 4:
-                batch_img = batch_img[:, :, :, None]
+                batch_img = np.repeat(batch_img[:, :, :, None], 3, -1)
+            batch_img = [Image.fromarray(img) for img in batch_img]
+            batch_img = np.array([np.array(img.convert('YCbCr')) for img in batch_img], dtype=np.float32)
             batch_img = batch_img / 255.0
             batch_img = dctn(batch_img, axes=(1, 2), norm='ortho')
             batch_img = zigzag_scan_batch(batch_img, model._zigzag)
@@ -258,7 +266,7 @@ def train(model, dataset, n_epoch, batch_size, lr, postfix):
         return loss / step
     def loss_fn(model, x):
         return model(x)
-    f_name = f'{dataset.info.dataset_name}_dct_{datetime.now().strftime("%Y%m%d_%H%M%S")}{postfix}'
+    f_name = f'{dataset.info.dataset_name}_cmp_{datetime.now().strftime("%Y%m%d_%H%M%S")}{postfix}'
     print(f'{f_name} {model.image_shape} {model.n_chop} {model.dim}')
     loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
     _n_steps = math.ceil(n_epoch * len(dataset) / batch_size)
@@ -298,7 +306,7 @@ def train(model, dataset, n_epoch, batch_size, lr, postfix):
     model.load_weights(f'{f_name}.safetensors')
     sample(model=model, f_name=f_name, n_sample_per_side=10)
 
-def main(dataset_name='cifar10', label=5, n_chop=4, n_head=1, n_diff=1000, n_epoch=200, batch_size=128, lr=3e-4, n_loop=4, n_layer=16, postfix=''):
+def main(dataset_name='cifar10', label=5, n_chop=16, n_head=1, n_diff=10000, n_epoch=200, batch_size=128, lr=3e-4, n_loop=4, n_layer=16, postfix=''):
     dataset, image_shape = get_dataset_info(dataset_name=dataset_name, batch_size=batch_size, label=label)
     model = Aggressor(image_shape=image_shape, n_chop=n_chop, n_head=n_head, n_diff=n_diff, n_loop=n_loop, n_layer=n_layer)
     train(model=model, dataset=dataset, n_epoch=n_epoch, batch_size=batch_size, lr=lr, postfix=postfix)
@@ -306,5 +314,4 @@ def main(dataset_name='cifar10', label=5, n_chop=4, n_head=1, n_diff=1000, n_epo
     # sample(model=model, f_name='cifar', n_sample_per_side=10)
 
 if __name__ == '__main__':
-    # main('mnist', label=None, n_chop=2, n_epoch=20, batch_size=128, n_layer=4)
     fire.Fire(main)

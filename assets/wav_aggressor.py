@@ -8,13 +8,13 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
+import soundfile as sf
 from datasets import load_dataset, load_from_disk
 from einops.array_api import rearrange
 from mlx.utils import tree_flatten
 from PIL import Image
 from scipy.fftpack import idct
 from scipy.io import wavfile
-import soundfile as sf
 
 EPS = 1e-5
 
@@ -118,8 +118,7 @@ class Scheduler(nn.Module):
         alpha_bar = self._alpha_cumprods[t][:,None,None]
         res = mx.sqrt(alpha_bar) * x_0 + mx.sqrt(1 - alpha_bar) * eps
         return res
-    def backward(self, model, x_t, t):
-        eps_t = model(x_t, mx.array([t] * x_t.shape[0]))
+    def backward(self, eps_t, x_t, t):
         mu_t = (x_t - (1 - self._alphas[t]) / mx.sqrt(1 - self._alpha_cumprods[t]) * eps_t) / mx.sqrt(self._alphas[t])
         if t == 0:
             return mu_t
@@ -192,9 +191,9 @@ class Aggressor(nn.Module):
             cond, cache = self.transformer(cond_seq, cache=cache)
             x = mx.random.normal((batch_size, 1, self.dim))
             for t in range(self.n_diff - 1, -1, -1):
-                t_batch = mx.array([t] * batch_size)
-                eps_theta = self.diffusion(x, t_batch, cond[:, -1:])
-                x = self.scheduler.backward(lambda x, t: self.diffusion(x, t, cond[:, -1:]), x, t)
+                eps_t = self.diffusion(x, mx.array([t] * batch_size), cond[:, -1:])
+                x = self.scheduler.backward(eps_t, x, t)
+                mx.eval(x)
             generated = mx.concatenate([generated, x], axis=1)
             cond_seq = x
             mx.eval(cache, cond_seq, generated)

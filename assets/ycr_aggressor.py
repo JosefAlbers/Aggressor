@@ -23,9 +23,7 @@ def get_dataset_info(dataset_name, batch_size, label=5):
     _take = (len(dataset) // batch_size) * batch_size
     dataset = dataset.take(_take)
     sample = np.array(dataset[0]['image'] if 'image' in dataset[0] else dataset[0]['img'])
-    if sample.ndim < 3:
-        sample = sample[:, :, None]
-    return dataset, sample.shape
+    return dataset, (*sample.shape[:2], 3)
 
 class MLP(nn.Module):
     def __init__(self, dim, out_dim=None):
@@ -127,8 +125,7 @@ class Scheduler(nn.Module):
         alpha_bar = self._alpha_cumprods[t][:,None,None]
         res = mx.sqrt(alpha_bar) * x_0 + mx.sqrt(1 - alpha_bar) * eps
         return res
-    def backward(self, model, x_t, t):
-        eps_t = model(x_t, mx.array([t] * x_t.shape[0]))
+    def backward(self, eps_t, x_t, t):
         mu_t = (x_t - (1 - self._alphas[t]) / mx.sqrt(1 - self._alpha_cumprods[t]) * eps_t) / mx.sqrt(self._alphas[t])
         if t == 0:
             return mu_t
@@ -215,9 +212,8 @@ class Aggressor(nn.Module):
             cond, cache = self.transformer(cond_seq, cache=cache)
             x = mx.random.normal((batch_size, 1, self.dim))
             for t in range(self.n_diff - 1, -1, -1):
-                t_batch = mx.array([t] * batch_size)
-                eps_theta = self.diffusion(x, t_batch, cond[:, -1:])
-                x = self.scheduler.backward(lambda x, t: self.diffusion(x, t, cond[:, -1:]), x, t)
+                eps_t = self.diffusion(x, mx.array([t] * batch_size), cond[:, -1:])
+                x = self.scheduler.backward(eps_t, x, t)
                 mx.eval(x)
             generated = mx.concatenate([generated, x], axis=1)
             cond_seq = x
@@ -240,23 +236,19 @@ def sample(model, f_name='aggressor', n_sample_per_side=4):
         x = x.squeeze(-1)
         Image.fromarray(x).save(f'{f_name}.png')
     else:
-        y = np.clip(x[:,:,0], 0, 255).astype(np.uint8)
-        cb = np.clip(x[:,:,1], 16, 240).astype(np.uint8)
-        cr = np.clip(x[:,:,2], 16, 240).astype(np.uint8)
-        ycbcr = np.stack([y, cb, cr], axis=-1)
-        Image.fromarray(ycbcr.astype('uint8'), mode='YCbCr').convert('RGB').save(f'{f_name}.png')
+        x = np.clip(x, 0, 255).astype('uint8')
+        Image.fromarray(x, mode='YCbCr').convert('RGB').save(f'{f_name}.png')
     print(f'Saved {n_sample_per_side**2} images to {f_name}.png ({time.perf_counter() - tic:.2f} sec)')
 
 def train(model, dataset, n_epoch, batch_size, lr, postfix):
     def get_batch(dataset):
         for i in range(0, len(dataset), batch_size):
             batch = dataset[i:i+batch_size]
-            batch_img = np.array(batch['image' if 'image' in batch else 'img'], dtype=np.float32)
+            batch_img = np.array(batch['image' if 'image' in batch else 'img'], dtype=np.uint8)
             if batch_img.ndim < 4:
-                batch_img = batch_img[:, :, :, None]
-            else:
-                batch_img = [Image.fromarray(img.astype('uint8')) for img in batch_img]
-                batch_img = np.array([np.array(img.convert('YCbCr')) for img in batch_img])
+                batch_img = np.repeat(batch_img[:, :, :, None], 3, -1)
+            batch_img = [Image.fromarray(img) for img in batch_img]
+            batch_img = np.array([np.array(img.convert('YCbCr')) for img in batch_img], dtype=np.float32)
             batch_img = batch_img / 255.0
             batch_img = dctn(batch_img, axes=(1, 2), norm='ortho')
             batch_img = zigzag_scan_batch(batch_img, model._zigzag)
@@ -311,12 +303,12 @@ def train(model, dataset, n_epoch, batch_size, lr, postfix):
     model.load_weights(f'{f_name}.safetensors')
     sample(model=model, f_name=f_name, n_sample_per_side=10)
 
-def main(dataset_name='cifar10', label=5, n_chop=1, n_head=1, n_diff=1000, n_epoch=200, batch_size=128, lr=3e-4, n_loop=4, n_layer=16, postfix=''):
+def main(dataset_name='cifar10', label=5, n_chop=16, n_head=1, n_diff=1000, n_epoch=200, batch_size=128, lr=3e-4, n_loop=4, n_layer=16, postfix=''):
     dataset, image_shape = get_dataset_info(dataset_name=dataset_name, batch_size=batch_size, label=label)
     model = Aggressor(image_shape=image_shape, n_chop=n_chop, n_head=n_head, n_diff=n_diff, n_loop=n_loop, n_layer=n_layer)
     train(model=model, dataset=dataset, n_epoch=n_epoch, batch_size=batch_size, lr=lr, postfix=postfix)
     # model.load_weights('cifar.safetensors')
-    # sample(model=model, f_name='aggressor_cifar', n_sample_per_side=10)
+    # sample(model=model, f_name='cifar', n_sample_per_side=10)
 
 if __name__ == '__main__':
     fire.Fire(main)

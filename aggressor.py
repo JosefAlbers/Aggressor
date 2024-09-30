@@ -126,8 +126,7 @@ class Scheduler(nn.Module):
         alpha_bar = self._alpha_cumprods[t][:,None,None]
         res = mx.sqrt(alpha_bar) * x_0 + mx.sqrt(1 - alpha_bar) * eps
         return res
-    def backward(self, model, x_t, t):
-        eps_t = model(x_t, mx.array([t] * x_t.shape[0]))
+    def backward(self, eps_t, x_t, t):
         mu_t = (x_t - (1 - self._alphas[t]) / mx.sqrt(1 - self._alpha_cumprods[t]) * eps_t) / mx.sqrt(self._alphas[t])
         if t == 0:
             return mu_t
@@ -181,9 +180,8 @@ class Aggressor(nn.Module):
             cond, cache = self.transformer(cond_seq, cache=cache)
             x = mx.random.normal((batch_size, 1, self.dim))
             for t in range(self.n_diff - 1, -1, -1):
-                t_batch = mx.array([t] * batch_size)
-                eps_theta = self.diffusion(x, t_batch, cond[:, -1:])
-                x = self.scheduler.backward(lambda x, t: self.diffusion(x, t, cond[:, -1:]), x, t)
+                eps_t = self.diffusion(x, mx.array([t] * batch_size), cond[:, -1:])
+                x = self.scheduler.backward(eps_t, x, t)
                 mx.eval(x)
             generated = mx.concatenate([generated, x], axis=1)
             cond_seq = x
@@ -271,7 +269,7 @@ def main(dataset_name='mnist', label=None, n_chop=2, n_head=1, n_diff=1000, n_ep
     model = Aggressor(image_shape=image_shape, n_chop=n_chop, n_head=n_head, n_diff=n_diff, n_loop=n_loop, n_layer=n_layer)
     train(model=model, dataset=dataset, n_epoch=n_epoch, batch_size=batch_size, lr=lr, postfix=postfix)
     # model.load_weights('cifar.safetensors')
-    # sample(model=model, f_name='aggressor_cifar', n_sample_per_side=10)
+    # sample(model=model, f_name='cifar', n_sample_per_side=10)
 
 if __name__ == '__main__':
     # main(dataset_name='cifar10', label=5, n_chop=8, n_epoch=200, n_layer=16)
