@@ -144,11 +144,11 @@ class Aggressor(nn.Module):
         self.n_diff = n_diff
         self.transformer = Transformer(dim=dim+2, n_head=n_head, n_layer=n_layer)
         self.diffusion = Denoiser(dim=dim, n_layer=n_layer)
-        self.scheduler = Scheduler(n_diff=n_diff)
         self.start_token = mx.zeros(dim)[None, None]
         self.n_loop = n_loop
         self._pe = mx.array(np.indices((n_chop, n_chop))).reshape(2, -1).T
-    def __call__(self, seq):
+
+    def __call__(self, seq, x0_fixed=None):
         seq = rearrange(seq, f'b (h ph) (w pw) c -> b (h w) (ph pw c)', ph=self.patch_size[0], pw=self.patch_size[1])
         B, S, _ = seq.shape
         cond_seq = seq[:, :-1]
@@ -158,18 +158,23 @@ class Aggressor(nn.Module):
         sum_loss = 0
         step = 0
         for _ in range(self.n_loop):
-            t = mx.random.randint(0, self.n_diff, (B,))
-            eps = mx.random.normal(seq.shape)
-            x_t = self.scheduler.forward(seq, t, eps)
-            eps_theta = self.diffusion(x_t, t, cond)
-            loss = mx.sum((eps - eps_theta) ** 2)
+            t = mx.random.uniform(0, 1, (B, 1, 1))
+            x1 = seq
+            if x0_fixed is not None:
+                x0 = x0_fixed 
+            else:
+                x0 = mx.random.normal(seq.shape)
+            x_t = t * x1 + (1 - t) * x0
+            v_target = x1 - x0
+            v_pred = self.diffusion(x_t, t.squeeze(), cond)
+            loss = mx.mean((v_pred - v_target) ** 2)
             if mx.isnan(loss):
                 print(loss.item())
                 continue
             sum_loss += loss
-            step += eps.size
-        avg_loss = sum_loss / step
-        return avg_loss
+            step += 1
+        return sum_loss / max(1, step)
+
     def sample(self, batch_size):
         num_patches = self.n_chop**2
         generated = mx.zeros((batch_size, 0, self.dim))
@@ -179,9 +184,12 @@ class Aggressor(nn.Module):
             cond_seq = mx.concatenate([cond_seq, mx.repeat(self._pe[p][None,None,:], batch_size, 0)], axis = -1)
             cond, cache = self.transformer(cond_seq, cache=cache)
             x = mx.random.normal((batch_size, 1, self.dim))
-            for t in range(self.n_diff - 1, -1, -1):
-                eps_t = self.diffusion(x, mx.array([t] * batch_size), cond[:, -1:])
-                x = self.scheduler.backward(eps_t, x, t)
+            dt = 1.0 / self.n_diff
+            for i in range(self.n_diff):
+                t_val = i / self.n_diff
+                t_batch = mx.array([t_val] * batch_size)
+                v_pred = self.diffusion(x, t_batch, cond[:, -1:])
+                x = x + v_pred * dt
                 mx.eval(x)
             generated = mx.concatenate([generated, x], axis=1)
             cond_seq = x
@@ -192,6 +200,89 @@ class Aggressor(nn.Module):
         generated = np.array(generated)
         generated = (np.clip(generated, -1, 1) + 1) / 2 * 255
         return generated.astype(np.uint8)
+
+    def reverse_sample(self, x1):
+        x1 = rearrange(x1, f'b (h ph) (w pw) c -> b (h w) (ph pw c)', ph=self.patch_size[0], pw=self.patch_size[1])
+        B, S, _ = x1.shape
+        cond_seq = x1[:, :-1]
+        cond_seq = mx.concatenate([mx.repeat(self.start_token, B, 0), cond_seq], axis=1)
+        cond_seq = mx.concatenate([cond_seq, mx.repeat(self._pe[None,:,:], B, 0)], axis = -1)
+        cond, _ = self.transformer(cond_seq)
+        x = x1
+        dt = -1.0 / self.n_diff
+        for i in range(self.n_diff, 0, -1):
+            t_val = i / self.n_diff
+            t_batch = mx.array([t_val] * B)
+            v_pred = self.diffusion(x, t_batch, cond)
+            x = x + v_pred * dt
+            mx.eval(x)
+        return x
+
+def generate_reflow_dataset(model, dataset, batch_size, f_name):
+    print(f"Generating Reflow Dataset: {f_name}_reflow_data.npz")
+    model.eval()
+    x0_list = []
+    x1_list = []
+    def get_batch(dataset):
+        for i in range(0, len(dataset), batch_size):
+            batch = dataset[i:i+batch_size]
+            batch_img = np.array(batch['image' if 'image' in batch else 'img'], dtype=np.float32)
+            if batch_img.ndim < 4:
+                batch_img = batch_img[:, :, :, None]
+            batch_img = (((batch_img / 255.0) - 0.5) * 2.0)
+            yield mx.array(batch_img, dtype=mx.float32)
+    total = len(dataset)
+    count = 0
+    tic = time.perf_counter()
+    for x1 in get_batch(dataset):
+        x0_calculated = model.reverse_sample(x1)
+        x0_list.append(np.array(x0_calculated))
+        x1_list.append(np.array(x1))
+        count += x1.shape[0]
+        if count % 100 == 0:
+            print(f"Generated {count}/{total} pairs...")
+    x0_all = np.concatenate(x0_list, axis=0)
+    x1_all = np.concatenate(x1_list, axis=0)
+    np.savez_compressed(f'{f_name}_reflow_data.npz', x0=x0_all, x1=x1_all)
+    print(f"Saved reflow dataset ({time.perf_counter() - tic:.2f}s)")
+    return x0_all, x1_all
+
+def train_reflow(model, x0_data, x1_data, n_epoch, batch_size, lr, postfix):
+    dataset_len = len(x0_data)
+    
+    def get_reflow_batch():
+        indices = np.random.permutation(dataset_len)
+        for i in range(0, dataset_len, batch_size):
+            idx = indices[i:i+batch_size]
+            batch_x1 = mx.array(x1_data[idx])
+            batch_x0 = mx.array(x0_data[idx])
+            yield batch_x1, batch_x0
+
+    def loss_fn(model, x1, x0):
+        return model(x1, x0_fixed=x0)
+
+    f_name = f'reflow_{datetime.now().strftime("%Y%m%d_%H%M%S")}{postfix}'
+    print(f'Starting Reflow Training: {f_name}')
+    loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
+    optimizer = optim.Lion(learning_rate=lr) 
+    model.train()
+    for e in range(n_epoch):
+        total_loss = 0
+        step = 0
+        tic = time.perf_counter()
+        for x1, x0 in get_reflow_batch():
+            loss, grads = loss_and_grad_fn(model, x1, x0)
+            optimizer.update(model, grads)
+            mx.eval(loss, model, optimizer)
+            total_loss += loss.item()
+            step += 1
+        print(f'Reflow Epoch {e}: {total_loss/step:.4f} ({time.perf_counter() - tic:.2f}s)')
+        if (e+1) % (n_epoch//4) == 0:
+             mx.save_safetensors(f'{f_name}.safetensors', dict(tree_flatten(model.trainable_parameters())))
+             sample(model, f_name=f_name)
+    model.load_weights(f'{f_name}.safetensors')
+    sample(model=model, f_name=f_name, n_sample_per_side=10)
+    return model
 
 def sample(model, f_name='aggressor', n_sample_per_side=4):
     model.eval()
@@ -263,13 +354,20 @@ def train(model, dataset, n_epoch, batch_size, lr, postfix):
             sample(model=model, f_name=f_name)
     model.load_weights(f'{f_name}.safetensors')
     sample(model=model, f_name=f_name, n_sample_per_side=10)
+    return model
 
-def main(dataset_name='mnist', label=None, n_chop=2, n_head=1, n_diff=1000, n_epoch=20, batch_size=32, lr=3e-4, n_loop=4, n_layer=4, postfix=''):
+def main(dataset_name='mnist', label=None, n_chop=2, n_head=1, n_diff=25, n_epoch=20, batch_size=32, lr=3e-4, n_loop=4, n_layer=4, postfix='', do_reflow=True):
     dataset, image_shape = get_dataset_info(dataset_name=dataset_name, batch_size=batch_size, label=label)
     model = Aggressor(image_shape=image_shape, n_chop=n_chop, n_head=n_head, n_diff=n_diff, n_loop=n_loop, n_layer=n_layer)
-    train(model=model, dataset=dataset, n_epoch=n_epoch, batch_size=batch_size, lr=lr, postfix=postfix)
-    # model.load_weights('cifar.safetensors')
-    # sample(model=model, f_name='cifar', n_sample_per_side=10)
+    model = train(model=model, dataset=dataset, n_epoch=n_epoch, batch_size=batch_size, lr=lr, postfix=postfix)
+    if do_reflow:
+        x0_data, x1_data = generate_reflow_dataset(model, dataset, batch_size, f_name="base_run")
+        model = train_reflow(model, x0_data, x1_data, n_epoch=n_epoch, batch_size=batch_size, lr=lr*0.5, postfix="_reflow")
+    mx.save_safetensors(f'final.safetensors', dict(tree_flatten(model.trainable_parameters())))
+    del model
+    model = Aggressor(image_shape=image_shape, n_chop=n_chop, n_head=n_head, n_diff=4, n_loop=n_loop, n_layer=n_layer)
+    model.load_weights(f'final.safetensors')
+    sample(model=model, f_name='final', n_sample_per_side=10)
 
 if __name__ == '__main__':
     # main(dataset_name='cifar10', label=5, n_chop=8, n_epoch=200, n_layer=16)
