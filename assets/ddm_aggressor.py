@@ -5,6 +5,7 @@ import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
+
 VOCAB = '0123456789+='
 K, Kx = (len(VOCAB), len(VOCAB) + 1)
 M = K
@@ -207,12 +208,20 @@ def sample_committing(model, ker, B=8, steps=8, mode='confidence', temp=0.0, pro
     if prompt is not None:
         x = mx.where(free, x, prompt)
     n_free = int(free.sum(-1)[0].item())
+    if mode == 'block':
+        steps = max(1, math.ceil(n_free / block_size))
     ts = np.linspace(1.0, 0.0, steps + 1)
     for t, s in zip(ts[:-1], ts[1:]):
         mu, logits = predict_mu(model, x, t, B)
         x0hat = mx.argmax(logits, -1) if temp == 0 else mx.random.categorical(logits / temp)
         masked = x == M
-        if mode == 'remask':
+        if mode == 'remdm':
+            sig = min(0.1, (1.0 - a(s)) / max(a(t), 1e-09))
+            p_um = min((a(s) - (1.0 - sig) * a(t)) / max(1.0 - a(t), 1e-09), 1.0)
+            um = masked & (mx.random.uniform(shape=x.shape) < p_um)
+            rm = free & ~masked & (mx.random.uniform(shape=x.shape) < sig)
+            x = mx.where(um, x0hat, mx.where(rm, M, x))
+        elif mode == 'remask':
             proposal = mx.where(masked, x0hat, x)
             pconf = mx.take_along_axis(mu, proposal[..., None], -1).squeeze(-1)
             k_keep = int(round(n_free * a(s)))
@@ -269,7 +278,10 @@ def sample_tau(model, ker, B=8, steps=8, prompt=None):
         else:
             sc = a(t) / max(1 - a(t), 1e-09) * mx.softmax(out, -1)
         if ker.kind == 'absorb':
-            p = sc * ((a(s) - a(t)) / max(a(t), 1e-09))
+            if model.param == 'x0':
+                p = mx.softmax(out, -1) * ((a(s) - a(t)) / max(1 - a(t), 1e-09))
+            else:
+                p = sc * ((a(s) - a(t)) / max(a(t), 1e-09))
             active = x == M
         else:
             tau_i = min(math.log(max(a(s), 1e-06) / max(a(t), 1e-06)), 4.0)
@@ -297,7 +309,7 @@ def valid_samplers(kind, param):
     if param == 'x0' or kind == 'absorb':
         v.append('ancestral')
     if kind in ('absorb', 'hybrid'):
-        v += ['confidence', 'random', 'left', 'block'] + (['remask'] if param == 'x0' else [])
+        v += ['confidence', 'random', 'left', 'block', 'remdm'] + (['remask'] if param == 'x0' else [])
     if kind == 'absorb' or (kind == 'uniform' and param == 'ratio'):
         v.append('tau')
     return v
@@ -363,13 +375,17 @@ def main(kind='absorb', param='x0', objective='simple', sampler='confidence', st
     print('\n  FORWARD  pin "AA+BB=", generate "CCC"  (1 valid completion)')
     for smp in avail:
         acc, ex = evaluate(model, ker, smp, steps, temp=0.0, block_size=block_size)
-        lbl = f'{('T=' + str(T) if smp == 'ancestral' and kind in ('hybrid', 'structured') else steps)} steps'
+        lbl = f'T={T} steps' if smp == 'ancestral' and kind in ('hybrid', 'structured') else f'{math.ceil(3 / block_size)} NFE' if smp == 'block' else f'{steps} steps'
         print(f'    {smp:<11}{lbl:<11} acc {acc:.3f}   {ex}')
     print('\n  REVERSE  pin "=CCC", generate "AA+BB"  (19-67 valid completions; factorization bites)')
     for smp in avail:
         if smp == 'ancestral' and kind in ('hybrid', 'structured'):
             acc, ex = evaluate_rev(model, ker, smp, None, temp=temp)
             print(f'    {smp:<11}T={T} steps: {acc:.3f}   {ex}')
+            continue
+        if smp == 'block':
+            acc, ex = evaluate_rev(model, ker, smp, 1, temp=temp, block_size=block_size)
+            print(f'    {smp:<11}{math.ceil(5 / block_size)} NFE (set by block_size={block_size}): {acc:.3f}   {ex}')
             continue
         row = []
         for st in [1, 2, 3, 5]:
@@ -469,35 +485,37 @@ if __name__ == '__main__':
     fire.Fire(main)
 
 # kind=absorb  param=x0  objective=simple  sampler=confidence  T=32  steps=8  use_time=False
-#   compatible samplers for this cell: ['ancestral', 'confidence', 'random', 'left', 'block', 'remask', 'tau']
+#   compatible samplers for this cell: ['ancestral', 'confidence', 'random', 'left', 'block', 'remdm', 'remask', 'tau']
 #   L_prior (Eq 15) = 0.0000 nats/token (theta-free; the ELBO term training never touches)
-#   step   500  loss 1.3699  (7.0s)
-#   step  1000  loss 1.1882  (14.9s)
-#   step  1500  loss 0.9864  (22.7s)
-#   step  2000  loss 0.9684  (30.4s)
-#   step  2500  loss 0.9687  (38.0s)
-#   step  3000  loss 0.9659  (45.9s)
+#   step   500  loss 1.3976  (5.6s)
+#   step  1000  loss 1.2373  (13.4s)
+#   step  1500  loss 1.2048  (21.3s)
+#   step  2000  loss 1.1648  (28.0s)
+#   step  2500  loss 1.0576  (33.2s)
+#   step  3000  loss 1.0213  (39.8s)
 
 #   L(t)  [Table 4 "Denoising loss curve", from the training objective]
-#     t=0.12:0.10  t=0.25:0.44  t=0.38:0.76  t=0.50:1.02  t=0.62:1.28  t=0.75:1.46  t=0.88:1.57  t=1.00:1.61
+#     t=0.12:0.23  t=0.25:0.55  t=0.38:0.86  t=0.50:1.09  t=0.62:1.33  t=0.75:1.51  t=0.88:1.57  t=1.00:1.61
 
 #   FORWARD  pin "AA+BB=", generate "CCC"  (1 valid completion)
-#     ancestral  8 steps     acc 1.000   ['53+62=115', '10+10=020', '36+61=097']
-#     confidence 8 steps     acc 1.000   ['36+14=050', '55+57=112', '85+25=110']
-#     random     8 steps     acc 1.000   ['20+65=085', '60+16=076', '81+88=169']
-#     left       8 steps     acc 1.000   ['69+84=153', '75+41=116', '29+05=034']
-#     block      8 steps     acc 1.000   ['35+68=103', '98+24=122', '00+39=039']
-#     remask     8 steps     acc 1.000   ['39+33=072', '17+33=050', '06+36=042']
-#     tau        8 steps     acc 0.973   ['10+72=082', '45+16=061', '91+88=179']
+#     ancestral  8 steps     acc 0.383   ['46+95=141', '96+02=090', '27+41=069']
+#     confidence 8 steps     acc 0.684   ['16+95=111', '48+61=109', '80+39=119']
+#     random     8 steps     acc 0.488   ['12+89=100', '50+53=102', '00+35=035']
+#     left       8 steps     acc 0.707   ['04+74=077', '06+51=057', '41+27=068']
+#     block      2 NFE       acc 0.680   ['96+30=126', '93+93=185', '95+49=144']
+#     remdm      8 steps     acc 0.516   ['40+96=136', '73+76=150', '99+18=118']
+#     remask     8 steps     acc 0.668   ['75+28=103', '41+93=135', '55+54=110']
+#     tau        8 steps     acc 0.371   ['51+72=123', '16+52=079', '64+99=163']
 
 #   REVERSE  pin "=CCC", generate "AA+BB"  (19-67 valid completions; factorization bites)
-#     ancestral  1st:0.023  2st:0.262  3st:0.414  5st:0.605   ['18+14=032', '92+70=162', '18+48=116']
-#     confidence 1st:0.008  2st:0.078  3st:0.117  5st:0.746   ['92+65=157', '79+46=125', '48+74=122']
-#     random     1st:0.012  2st:0.379  3st:0.656  5st:0.902   ['83+17=100', '92+96=188', '05+83=088']
-#     left       1st:0.016  2st:0.906  3st:0.918  5st:0.957   ['08+26=034', '25+80=105', '29+08=017']
-#     block      1st:0.957  2st:0.922  3st:0.926  5st:0.918   ['45+25=070', '76+49=125', '40+90=130']
-#     remask     1st:0.012  2st:0.074  3st:0.734  5st:0.836   ['30+71=101', '88+21=109', '02+54=056']
-#     tau        1st:0.012  2st:0.016  3st:0.273  5st:0.586   ['11+42=063', '32+06=038', '35+97=132']
+#     ancestral  1st:0.008  2st:0.215  3st:0.395  5st:0.566   ['47+75=137', '85+23=108', '89+43=132']
+#     confidence 1st:0.008  2st:0.074  3st:0.117  5st:0.883   ['82+13=095', '75+92=167', '31+52=083']
+#     random     1st:0.012  2st:0.355  3st:0.539  5st:0.816   ['91+69=160', '94+43=137', '88+73=161']
+#     left       1st:0.023  2st:0.754  3st:0.785  5st:0.762   ['53+51=104', '29+49=078', '77+78=145']
+#     block      3 NFE (set by block_size=2): 0.805   ['07+88=095', '65+54=119', '68+09=077']
+#     remdm      1st:0.016  2st:0.266  3st:0.414  5st:0.508   ['28+25=053', '71+60=138', '77+25=098']
+#     remask     1st:0.012  2st:0.059  3st:0.641  5st:0.785   ['85+76=161', '04+52=056', '36+65=101']
+#     tau        1st:0.027  2st:0.262  3st:0.418  5st:0.566   ['94+41=140', '62+79=131', '83+36=109']
 
 #   INFILL  pin all but one operand digit  [Eq 6 conditioning; Sec 10.4]
-#      [('5_+45=103', '58+45=103'), ('8_+18=104', '86+18=104'), ('1_+96=115', '19+96=115'), ('1_+64=079', '15+64=079'), ('8_+99=186', '87+99=186'), ('9_+35=125', '90+35=125')]
+#      [('2_+19=046', '27+19=046'), ('5_+73=123', '50+73=123'), ('8_+67=154', '87+67=154'), ('6_+95=164', '69+95=164'), ('7_+50=120', '70+50=120'), ('1_+86=100', '14+86=100')]
